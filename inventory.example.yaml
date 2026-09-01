@@ -1,0 +1,38 @@
+# inventory.example.yaml — Bản mẫu, KHÔNG chứa IP/topology thật.
+# Copy file này thành inventory.yaml rồi sửa lại đúng theo lab/mạng thật
+# của bạn — inventory.yaml đã nằm trong .gitignore, không commit lên git.
+#
+# writable: true chỉ nên đặt cho các switch access mà network_write_tools.py
+# được phép gán cổng — router/switch phân phối/core nên để writable: false
+# (mặc định) vì rủi ro ảnh hưởng cao hơn nếu agent thao tác nhầm.
+#
+# Username/password đọc từ .env (NETWORK_USERNAME/NETWORK_PASSWORD/
+# NETWORK_ENABLE_SECRET) — có thể override riêng cho từng thiết bị bằng
+# cách thêm field username/password/secret ngay trong entry thiết bị đó,
+# nếu thiết bị dùng tài khoản khác tài khoản chung.
+
+devices:
+  Router_Center:
+    host: 192.0.2.1
+    device_type: cisco_ios
+    writable: false
+
+  Switch_Core_1:
+    host: 192.0.2.11
+    device_type: cisco_ios
+    writable: false
+
+  Switch_Core_2:
+    host: 192.0.2.12
+    device_type: cisco_ios
+    writable: false
+
+  Switch_Access_1:
+    host: 192.0.2.21
+    device_type: cisco_ios
+    writable: true
+
+  Switch_Access_2:
+    host: 192.0.2.22
+    device_type: cisco_ios
+    writable: true

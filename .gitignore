@@ -1,0 +1,11 @@
+.env
+venv
+__pycache__
+inventory.yaml
+
+# Log/artifact runtime — không phải source, và có thể chứa dữ liệu thiết bị
+# thật (kể cả hash mật khẩu trong raw_output/running-config từ trước khi
+# có bước redact tự động trong network_tools.py). Không commit.
+qa_log.md
+tool_calls.log
+output_example.txt

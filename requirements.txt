@@ -1,0 +1,5 @@
+crewai>=1.15.16
+python-dotenv>=1.2.3
+netmiko>=4.7.0
+ntc-templates>=9.2.0
+PyYAML>=6.0.3
