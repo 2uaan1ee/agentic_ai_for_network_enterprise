@@ -10,7 +10,7 @@ Multi-agent (CrewAI) hỗ trợ chẩn đoán, giám sát và vận hành mạng
 |---|---|---|
 | `engineer_agent` | READ | Chọn thiết bị + lệnh `show` phù hợp với câu hỏi, thu thập dữ liệu chẩn đoán |
 | `monitor_agent` | READ | Đọc CPU/RAM/lỗi interface, đối chiếu ngưỡng cảnh báo đã tính sẵn trong code |
-| `technical_agent` | WRITE (giới hạn) | Gán 1 cổng access vào 1 VLAN **đã tồn tại** — không có quyền tạo VLAN |
+| `technical_agent` | WRITE (giới hạn) | Gán access hoặc tag (trunk) 1 cổng vào 1 VLAN **đã tồn tại** — không có quyền tạo VLAN |
 | `report_agent` | Không có tool | Tổng hợp dữ liệu từ agent khác thành câu trả lời tiếng Anh cho người dùng |
 
 3 chế độ chạy tương ứng trong `main_network.py`: hỏi thông tin (read-only), xử lý ticket cấp phát VLAN/port (có ghi), giám sát sức khoẻ thiết bị.
@@ -21,9 +21,10 @@ Multi-agent (CrewAI) hỗ trợ chẩn đoán, giám sát và vận hành mạng
 - **Redact credential** — mọi `raw_output` (kể cả `show running-config`) được lọc bỏ enable secret / password / SNMP community trước khi đưa vào prompt gửi ra LLM cloud.
 - **Whitelist thiết bị ghi** — chỉ thiết bị đánh dấu `writable: true` trong `inventory.yaml` mới cho phép `technical_agent` ghi cấu hình.
 - **Blocklist VLAN** — VLAN quản trị (99) và mặc định (1) bị chặn cứng, không gán/tạo được qua tool.
-- **VLAN phải tồn tại sẵn** — `assign_access_port` không có quyền tạo VLAN; nếu VLAN đích chưa có trên thiết bị, tool dừng và báo lỗi ngay.
-- **Cổng xác nhận con người** — trước khi gửi bất kỳ lệnh ghi nào, tool in tóm tắt thay đổi và chờ quản trị viên gõ `yes`/`no` ngay trên console. Từ chối (hoặc không có console tương tác) → huỷ, không có lệnh nào được gửi xuống thiết bị. Cổng này nằm trong code của tool, không phải cơ chế review văn bản sau khi agent đã hành động.
-- **Lưu cấu hình sau khi ghi** — `assign_access_port`/`create_vlan` tự chạy `copy running-config startup-config` sau khi verify, tránh mất cấu hình khi thiết bị reload.
+- **VLAN phải tồn tại sẵn** — `assign_access_port`/`tag_vlan_on_port` không có quyền tạo VLAN; nếu VLAN đích chưa có trên thiết bị, tool dừng và báo lỗi ngay.
+- **Kiểm tra cổng trước khi ghi** — tool tự đọc và phân loại trạng thái cổng: đã đúng cấu hình → không gửi gì (`already_configured`); đang thuộc VLAN khác / đang có thiết bị kết nối → in cảnh báo và hỏi có muốn thay đổi không; đổi mode access ↔ trunk → phải gõ lại tên cổng thay vì `yes`. Tag trên trunk không bao giờ sửa `allowed vlan` (trunk để ALL).
+- **Cổng xác nhận con người** — trước khi gửi bất kỳ lệnh ghi nào, tool in tóm tắt thay đổi và chờ quản trị viên xác nhận ngay trên console. Từ chối (hoặc không có console tương tác) → huỷ, không có lệnh nào được gửi xuống thiết bị. Cổng này nằm trong code của tool, không phải cơ chế review văn bản sau khi agent đã hành động.
+- **Lưu cấu hình sau khi ghi** — `assign_access_port`/`tag_vlan_on_port`/`create_vlan` tự chạy `copy running-config startup-config` sau khi verify, tránh mất cấu hình khi thiết bị reload.
 - **Verify trạng thái thật** — mọi lệnh ghi đều đọc lại trạng thái thiết bị sau khi đổi, không chỉ tin lệnh đã chạy không lỗi.
 
 ## Cài đặt
@@ -54,7 +55,7 @@ cp inventory.example.yaml inventory.yaml
 python main_network.py
 ```
 
-Chọn 1 trong 3 chế độ (hỏi thông tin / ticket cấp phát VLAN-port / giám sát). Mọi tương tác — kể cả khi gặp lỗi giữa chừng (API rate limit, SSH timeout...) — đều được ghi lại vào `qa_log.md` (local, không commit).
+Chọn 1 trong 3 chế độ (hỏi thông tin / ticket cấp phát VLAN-port / giám sát). Mọi tương tác — kể cả khi gặp lỗi giữa chừng (API rate limit, SSH timeout...) — đều được ghi lại vào `qa_log.md` (local, không commit). Ngoài ra mỗi lần chạy chương trình được lưu vào 1 file riêng trong `output/`: `lan_1.md`, `lan_2.md`, ... (lấy số lớn nhất đang có + 1). Mọi câu hỏi trong lần chạy đó được ghi nối tiếp vào file này, gồm câu hỏi, câu trả lời cuối và output thô của từng bước — file của các lần chạy trước không bị ghi đè.
 
 ## Lưu ý riêng tư
 

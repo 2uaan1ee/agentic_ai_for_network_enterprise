@@ -16,11 +16,12 @@ nhạy cảm thì cần cân nhắc lại.
 """
 
 import os
+from typing import Literal, Optional
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
 from crewai import Agent, Task, Crew, Process, LLM
 
 from network_tools import run_show_command, list_available_devices, count_up_ports
-from network_write_tools import list_vlans, check_port_status, list_free_ports, assign_access_port
 from network_monitoring_tools import check_device_health, check_interface_errors
 
 load_dotenv()  # phòng trường hợp import module này trước network_tools
@@ -105,16 +106,19 @@ llm = LLM(**_llm_kwargs)
 # Agent permission model — 2 explicit tiers, named accordingly:
 #   READ  : engineer_agent, monitor_agent — read-only tools (SSH "show"
 #           only), used for querying/diagnosing information.
-#   WRITE : technical_agent               — the only agent with a tool that
-#           can change device config, and even then only 1 action (assign
-#           an access port to an EXISTING VLAN — see network_write_tools.py).
-#           It has NO create_vlan tool: it can only inspect current state
-#           (list_vlans, check_port_status, list_free_ports) and, if valid,
-#           assign — and even that last step is gated by a mandatory
-#           human yes/no confirmation printed on the console before any
-#           write command reaches the device (see assign_access_port_text
-#           in network_write_tools.py — the gate lives in code, not in
-#           agent behavior).
+#   WRITE : NO agent holds a write tool. technical_agent only INTERPRETS a
+#           port/VLAN ticket into structured parameters (device, interface,
+#           vlan_id, access|tag). main_network.py then calls the write
+#           function (assign_access_port_text / tag_vlan_on_port_text in
+#           network_write_tools.py) itself, on the MAIN thread. Reasons:
+#           - CrewAI 1.15 runs tools in worker threads under a live Rich
+#             console, so the yes/no input() of the write tool could get
+#             hidden/stuck there;
+#           - the agent kept taking detours (list_free_ports...) and could
+#             loop. LLM decides parameters, code executes.
+#           The write functions check that the VLAN exists, classify the
+#           port's current state (free / other VLAN / connected / trunk),
+#           and gate every write behind a human confirmation.
 # report_agent holds no device tools at all (zero permission) — it only
 # synthesizes text from data the other agents already collected.
 # ---------------------------------------------------------------------------
@@ -159,41 +163,26 @@ report_agent = Agent(
 
 
 technical_agent = Agent(
-    role="Network Technical Agent (Port Assignment Only)",
+    role="Network Technical Agent (Ticket Interpretation)",
     goal=(
-        "Assign an existing access port to an existing VLAN exactly as "
-        "requested, but ONLY after verifying the VLAN already exists and "
-        "checking the port's current state — never creating VLANs, never "
-        "touching routing/IP, and never sending a write command without "
-        "the administrator's explicit go-ahead."
+        "Turn a free-text port/VLAN ticket into exact parameters: device "
+        "name, physical interface, VLAN ID and mode (access or tag)."
     ),
     backstory=(
-        "You are a network operations technician with permission to "
-        "assign access ports to VLANs — and nothing else. You have NO "
-        "tool to create a VLAN: your available tools only let you look, "
-        "then, if it's actually valid, assign. When you receive a "
-        "request (e.g. 'assign VLAN 60 to port Ethernet0/1 on some access "
-        "switch'), you follow this order every time: (1) if the device "
-        "name is vague, use the device-listing tool to find the exact "
-        "name; (2) call list_vlans to check whether the target VLAN "
-        "already exists on that device — if it doesn't, you cannot "
-        "proceed, stop and report that a VLAN must be created first by "
-        "someone with that permission; (3) call check_port_status on the "
-        "target port to see its current mode (access/trunk) and VLAN, so "
-        "you understand what you're about to change; (4) only then call "
-        "assign_access_port. That tool itself will print a summary and "
-        "pause for the administrator to type yes/no on the console before "
-        "it sends anything to the real device — if the administrator "
-        "declines, the tool returns a 'cancelled' result, which is a "
-        "normal outcome to report back, not an error. After a successful "
-        "assignment, always read the verify section of the result "
-        "carefully to confirm the port actually came up (status up) — "
-        "don't just trust that the command ran without error."
+        "You read port/VLAN tickets written by network admins, often short "
+        "and in Vietnamese, e.g. 'gán port e0/2 của switch acc04 cho vlan "
+        "30' or 'tag vlan 30 vào e1/1 trên Switch_Acc003'. You use the "
+        "device-listing tool once to map a vague device name (e.g. 'acc04', "
+        "'switch access 4') to the exact inventory name (e.g. "
+        "'Switch_Acc004'). You do NOT configure anything and do NOT inspect "
+        "ports — the system does that after you, with its own checks and "
+        "an administrator confirmation."
     ),
-    tools=[list_available_devices, list_vlans, check_port_status, list_free_ports, assign_access_port],
+    tools=[list_available_devices],
     llm=llm,
     verbose=True,
     allow_delegation=False,
+    max_iter=4,
 )
 
 
@@ -260,77 +249,76 @@ def build_crew(question: str) -> Crew:
     )
 
 
-def build_provision_crew(ticket_description: str) -> Crew:
-    """Crew that handles VLAN/port assignment tickets — WRITES config,
-    unlike build_crew() (read-only). technical_agent has NO create_vlan
-    tool: it can only inspect current state (list_vlans, check_port_status,
-    list_free_ports) and assign an access port to a VLAN that already
-    exists. Even the assign step itself is gated by a mandatory human
-    yes/no confirmation printed on the console before any write command
-    reaches the device (see assign_access_port_text in
-    network_write_tools.py) — the crew/task text below cannot bypass that
-    gate, it lives in code."""
-    task_configure = Task(
+class PortVlanRequest(BaseModel):
+    """Tham số đã tách từ 1 ticket gán/tag VLAN cho cổng."""
+    device_name: Optional[str] = Field(None, description="Exact device name from inventory, e.g. 'Switch_Acc004'")
+    interface: Optional[str] = Field(None, description="Physical interface as written, e.g. 'e0/2' or 'Ethernet0/2'")
+    vlan_id: Optional[int] = Field(None, description="Target VLAN ID")
+    mode: Literal["access", "tag"] = Field("access", description="'tag' if the ticket says tag/tagged/trunk, else 'access'")
+    error: str = Field("", description="Non-empty if any field cannot be determined from the ticket: say which one")
+
+
+def build_ticket_parse_crew(ticket_description: str) -> Crew:
+    """Crew 1 agent, CHỈ đọc hiểu ticket -> PortVlanRequest. Không có tool
+    ghi nào ở đây: main_network.py nhận tham số này rồi tự gọi hàm ghi (có
+    kiểm tra + xác nhận của quản trị viên) trên luồng chính."""
+    task_parse = Task(
         description=(
             f'Ticket request: "{ticket_description}"\n\n'
-            "Extract the device name, physical port name, and target VLAN "
-            "from the request above (use the device-listing tool if the "
-            "device name is vague). Call list_vlans on that device first "
-            "to confirm the target VLAN already exists — you have NO tool "
-            "to create one, so if it doesn't exist, stop and report that "
-            "instead of attempting anything further. Call check_port_status "
-            "on the target port to see its current mode/VLAN before "
-            "changing anything. Only then call assign_access_port — it "
-            "will pause for the administrator's yes/no confirmation on the "
-            "console before sending anything to the device, and may come "
-            "back with status 'cancelled' if declined; that is a valid "
-            "outcome to report, not an error. If the assignment went "
-            "through, read the verify section of the result carefully to "
-            "confirm the port is actually up."
+            "Extract: the exact device name (call the device-listing tool "
+            "once if the ticket uses a short/vague name like 'acc04'), the "
+            "physical interface, the VLAN ID, and the mode ('tag' if the "
+            "ticket says tag/tagged/trunk, otherwise 'access'). Do not "
+            "guess: if something is missing from the ticket, leave it null "
+            "and explain in 'error'."
         ),
-        expected_output=(
-            "JSON data showing the VLAN/port checks performed and the "
-            "final result: either commands_issued with the verify status, "
-            "or a 'cancelled' status, or an error explaining why the "
-            "request could not proceed (e.g. VLAN doesn't exist)."
-        ),
+        expected_output="A PortVlanRequest object.",
         agent=technical_agent,
+        output_pydantic=PortVlanRequest,
+    )
+    return Crew(
+        agents=[technical_agent],
+        tasks=[task_parse],
+        process=Process.sequential,
+        verbose=True,
     )
 
+
+def build_provision_report_crew(ticket_description: str, write_result_json: str) -> Crew:
+    """report_agent viết báo cáo từ JSON kết quả của hàm ghi (đã chạy xong
+    trong main_network.py) — agent không có tool, chỉ diễn giải."""
     task_report_configure = Task(
         description=(
-            "Based on the result from the previous step, write a "
-            "complete English report on ticket: "
-            f'"{ticket_description}"\n'
-            "State clearly what was found (did the VLAN already exist? "
-            "what was the port's state beforehand?) and the final "
-            "outcome: if assigned, report the real port status after "
-            "configuration (based on verify_status/verify_switchport) "
-            "confirming the port is actually ready to use, not just "
-            "'command ran successfully' — and state whether the "
-            "configuration was saved to startup-config (config_saved "
-            "field); if config_saved is false, warn clearly that the "
-            "change is only in running-config and will be LOST on a "
-            "device reload. If the administrator declined "
-            "the confirmation (status 'cancelled'), report that plainly "
-            "— it is not an error, just a decision. If there was a real "
-            "error (e.g. device not writable, VLAN doesn't exist, VLAN "
-            "blocked), explain the reason clearly in plain English "
-            "instead of just returning the raw error JSON."
+            f'Ticket: "{ticket_description}"\n\n'
+            "Result of the port/VLAN change, produced by the system:\n"
+            f"{write_result_json}\n\n"
+            "Write a complete English report on this ticket. State clearly "
+            "what was found (did the VLAN exist? was the port free, or "
+            "already in another VLAN / connected / a trunk — see "
+            "port_before.in_use_reasons?) and the final outcome by "
+            "'status': 'applied' -> report the real port state after the "
+            "change (port_after / verify_switchport / verify_status), not "
+            "just 'command ran successfully'; 'applied_but_not_verified' "
+            "-> warn clearly that the port does NOT show the requested "
+            "state and quote verify_switchport; 'already_configured' -> "
+            "say nothing needed to change; 'cancelled' -> the "
+            "administrator declined, not an error; 'blocked'/'error' -> "
+            "explain the reason in plain English (e.g. VLAN doesn't exist, "
+            "device not writable, routed port). When a change was applied, "
+            "state whether it was saved to startup-config (config_saved); "
+            "if false, warn that the change will be LOST on reload."
         ),
         expected_output=(
             "An English report describing the checks performed and the "
-            "final outcome (assigned / cancelled by administrator / "
-            "blocked), with the real port status for cross-checking when "
-            "applicable."
+            "final outcome (applied / already configured / cancelled by "
+            "administrator / blocked), with the real port status for "
+            "cross-checking when applicable."
         ),
         agent=report_agent,
-        context=[task_configure],
     )
-
     return Crew(
-        agents=[technical_agent, report_agent],
-        tasks=[task_configure, task_report_configure],
+        agents=[report_agent],
+        tasks=[task_report_configure],
         process=Process.sequential,
         verbose=True,
     )

@@ -7,5 +7,6 @@ inventory.yaml
 # thật (kể cả hash mật khẩu trong raw_output/running-config từ trước khi
 # có bước redact tự động trong network_tools.py). Không commit.
 qa_log.md
+output/
 tool_calls.log
 output_example.txt
